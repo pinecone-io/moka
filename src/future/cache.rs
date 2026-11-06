@@ -3383,6 +3383,163 @@ mod tests {
         assert_eq!(key_set.len(), NUM_KEYS);
     }
 
+    #[tokio::test]
+    async fn test_iter_skips_entries_invalidated_by_invalidate_all_after_scan() {
+        let cache = Cache::new(10_000);
+        for key in 0..1_000u32 {
+            cache.insert(key, key).await;
+        }
+
+        let mut iter = cache.iter();
+        iter.next().expect("first entry");
+        cache.invalidate_all();
+        assert!(iter.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_iter_skips_entries_invalidated_by_predicate_after_scan() {
+        let cache = Cache::builder()
+            .max_capacity(10_000)
+            .support_invalidation_closures()
+            .build();
+        for key in 0..1_000u32 {
+            cache.insert(key, key).await;
+        }
+
+        let mut iter = cache.iter();
+        iter.next().expect("first entry");
+        std::thread::sleep(Duration::from_millis(5));
+        cache
+            .invalidate_entries_if(|_, v| v % 2 == 0)
+            .expect("invalidation closures are supported");
+        assert!(iter.all(|(_, v)| v % 2 == 1));
+    }
+
+    #[tokio::test]
+    async fn test_iter_skips_entries_expired_after_scan() {
+        let cache = Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(Duration::from_millis(100))
+            .build();
+        for key in 0..1_000u32 {
+            cache.insert(key, key).await;
+        }
+
+        let mut iter = cache.iter();
+        iter.next().expect("first entry");
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(iter.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_iter_skips_entries_evicted_after_scan() {
+        let cache = Cache::new(1_000);
+        for key in 0..1_000u32 {
+            cache.insert(key, key).await;
+        }
+        cache.run_pending_tasks().await;
+
+        let mut iter = cache.iter();
+        let (first, _) = iter.next().expect("first entry");
+        for key in 1_000..5_000u32 {
+            cache.insert(key, key).await;
+            cache.get(&key).await;
+            cache.get(&key).await;
+        }
+        cache.run_pending_tasks().await;
+
+        for (key, _) in iter {
+            if *key < 1_000 && *key != *first {
+                assert!(cache.contains_key(&*key), "evicted key {key} yielded");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_iter_yields_entries_reinserted_after_scan() {
+        const NUM_KEYS: u32 = 1_000;
+
+        let cache = Cache::new(10_000);
+        for key in 0..NUM_KEYS {
+            cache.insert(key, 0).await;
+        }
+
+        let mut iter = cache.iter();
+        iter.next().expect("first entry");
+        for key in 0..NUM_KEYS {
+            cache.invalidate(&key).await;
+            cache.insert(key, 1).await;
+        }
+        let rest: Vec<_> = iter.collect();
+        assert_eq!(rest.len(), NUM_KEYS as usize - 1);
+        assert!(rest.iter().all(|(_, v)| *v == 1));
+    }
+
+    #[test]
+    fn test_iter_yields_no_duplicates_while_table_resizes() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            for round in 0..20 {
+                let cache: Cache<u64, u64> = Cache::new(1_000_000);
+                for key in 0..2_000u64 {
+                    cache.insert(key, key).await;
+                }
+
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let writers: Vec<_> = (0..3u64)
+                    .map(|t| {
+                        let cache = cache.clone();
+                        let stop = Arc::clone(&stop);
+                        tokio::spawn(async move {
+                            let mut key = 1_000_000 * (t + 1);
+                            while !stop.load(Ordering::Relaxed) {
+                                cache.insert(key, key).await;
+                                if key % 3 == 0 {
+                                    cache.invalidate(&(key % 2_000)).await;
+                                }
+                                key += 1;
+                                if key % 64 == 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                let mut seen = std::collections::HashSet::new();
+                for (key, _) in cache.iter() {
+                    assert!(seen.insert(*key), "duplicate key {key} in round {round}");
+                }
+                stop.store(true, Ordering::Relaxed);
+                for writer in writers {
+                    writer.await.expect("writer task");
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn test_iter_yields_values_updated_after_scan() {
+        const NUM_KEYS: usize = 1_000;
+
+        let cache = Cache::new(10_000);
+        for key in 0..NUM_KEYS {
+            cache.insert(key, 0).await;
+        }
+
+        let mut iter = cache.iter();
+        iter.next().expect("first entry");
+        for key in 0..NUM_KEYS {
+            cache.insert(key, 1).await;
+        }
+        let rest: Vec<_> = iter.collect();
+        assert_eq!(rest.len(), NUM_KEYS - 1);
+        assert!(rest.iter().all(|(_, v)| *v == 1));
+    }
+
     /// Runs 16 async tasks at the same time and ensures no deadlock occurs.
     ///
     /// - Eight of the task will update key-values in the cache.

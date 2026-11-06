@@ -21,7 +21,7 @@ use crate::{
         },
         deque::{DeqNode, Deque},
         frequency_sketch::FrequencySketch,
-        iter::ScanningGet,
+        iter::{ScannedEntry, ScanningGet},
         time::{AtomicInstant, Clock, Instant},
         timer_wheel::{ReschedulingResult, TimerWheel},
         CacheRegion, HousekeeperConfig,
@@ -446,6 +446,33 @@ where
     fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
         self.inner.keys(cht_segment)
     }
+
+    fn scanned_entries(&self, cht_segment: usize) -> Option<Vec<ScannedEntry<K, V>>> {
+        self.inner.cache.entries(cht_segment, |key, entry| {
+            Some(ScannedEntry::Entry {
+                key: Arc::clone(key),
+                entry: MiniArc::clone(entry),
+            })
+        })
+    }
+
+    fn scanned_value(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> Option<V> {
+        if entry.entry_info().is_retired() || entry.is_superseded() {
+            return self.scanning_get(key);
+        }
+        let i = &self.inner;
+        let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+        let now = self.current_time();
+        if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+            || is_expired_entry_wo(ttl, va, entry, now)
+            || is_expired_entry_ao(tti, va, entry, now)
+            || i.is_invalidated_entry(key, entry)
+        {
+            None
+        } else {
+            Some(entry.value.clone())
+        }
+    }
 }
 
 //
@@ -542,6 +569,7 @@ where
                 self.do_post_insert_steps(ts, &key, ins_op)
             }
             (_, Some((_cnt, old_entry, upd_op))) => {
+                old_entry.entry.set_superseded();
                 self.do_post_update_steps(ts, key, old_entry, upd_op, &self.interrupted_op_ch_snd)
                     .await
             }

@@ -1,5 +1,16 @@
 use std::{hash::Hash, sync::Arc};
 
+use crate::common::concurrent::{arc::MiniArc, ValueEntry};
+
+/// An item collected by scanning a segment of the concurrent hash table.
+pub(crate) enum ScannedEntry<K, V> {
+    Key(Arc<K>),
+    Entry {
+        key: Arc<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+    },
+}
+
 // This trait is implemented by `sync::BaseCache` and `sync::Cache`.
 pub(crate) trait ScanningGet<K, V> {
     /// Returns the number of segments in the concurrent hash table.
@@ -14,13 +25,32 @@ pub(crate) trait ScanningGet<K, V> {
 
     /// Returns a vec of keys in a specified segment of the concurrent hash table.
     fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>>;
+
+    /// Returns a vec of scanned entries in a specified segment of the concurrent hash
+    /// table.
+    ///
+    /// The default implementation returns the keys only, so each key is looked up
+    /// with `scanning_get` when it is yielded.
+    fn scanned_entries(&self, cht_segment: usize) -> Option<Vec<ScannedEntry<K, V>>> {
+        self.keys(cht_segment)
+            .map(|keys| keys.into_iter().map(ScannedEntry::Key).collect())
+    }
+
+    /// Returns a _clone_ of the value of a scanned entry.
+    ///
+    /// If the entry has been removed or replaced since the scan, this method looks up
+    /// the key with `scanning_get` instead. Like `scanning_get`, this method is not
+    /// considered a cache read operation.
+    fn scanned_value(&self, key: &Arc<K>, _entry: &MiniArc<ValueEntry<K, V>>) -> Option<V> {
+        self.scanning_get(key)
+    }
 }
 
 /// Iterator visiting all key-value pairs in a cache in arbitrary order.
 ///
 /// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
 pub struct Iter<'i, K, V> {
-    keys: Option<Vec<Arc<K>>>,
+    entries: Option<Vec<ScannedEntry<K, V>>>,
     cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
     num_cht_segments: usize,
     cache_seg_index: usize,
@@ -34,7 +64,7 @@ impl<'i, K, V> Iter<'i, K, V> {
         num_cht_segments: usize,
     ) -> Self {
         Self {
-            keys: None,
+            entries: None,
             cache_segments: Box::new([cache]),
             num_cht_segments,
             cache_seg_index: 0,
@@ -49,7 +79,7 @@ impl<'i, K, V> Iter<'i, K, V> {
         num_cht_segments: usize,
     ) -> Self {
         Self {
-            keys: None,
+            entries: None,
             cache_segments,
             num_cht_segments,
             cache_seg_index: 0,
@@ -71,9 +101,15 @@ where
             return None;
         }
 
-        while let Some(key) = self.next_key() {
-            if let Some(v) = self.cache().scanning_get(&key) {
-                return Some((key, v));
+        while let Some(scanned) = self.next_scanned() {
+            let item = match scanned {
+                ScannedEntry::Key(key) => self.cache().scanning_get(&key).map(|v| (key, v)),
+                ScannedEntry::Entry { key, entry } => {
+                    self.cache().scanned_value(&key, &entry).map(|v| (key, v))
+                }
+            };
+            if item.is_some() {
+                return item;
             }
         }
 
@@ -91,18 +127,18 @@ where
         self.cache_segments[self.cache_seg_index]
     }
 
-    fn next_key(&mut self) -> Option<Arc<K>> {
-        while let Some(keys) = self.current_keys() {
-            if let key @ Some(_) = keys.pop() {
-                return key;
+    fn next_scanned(&mut self) -> Option<ScannedEntry<K, V>> {
+        while let Some(entries) = self.current_entries() {
+            if let scanned @ Some(_) = entries.pop() {
+                return scanned;
             }
         }
         None
     }
 
-    fn current_keys(&mut self) -> Option<&mut Vec<Arc<K>>> {
-        // If keys is none or some but empty, try to get next keys.
-        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+    fn current_entries(&mut self) -> Option<&mut Vec<ScannedEntry<K, V>>> {
+        // If entries is none or some but empty, try to get next entries.
+        while self.entries.as_ref().map_or(true, Vec::is_empty) {
             // Adjust indices.
             if self.cht_seg_index >= self.num_cht_segments {
                 self.cache_seg_index += 1;
@@ -114,13 +150,13 @@ where
             }
 
             let cache_segment = self.cache_segments[self.cache_seg_index];
-            self.keys = cache_segment.keys(self.cht_seg_index);
+            self.entries = cache_segment.scanned_entries(self.cht_seg_index);
             self.num_cht_segments = cache_segment.num_cht_segments();
 
             self.cht_seg_index += 1;
         }
 
-        self.keys.as_mut()
+        self.entries.as_mut()
     }
 }
 

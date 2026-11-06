@@ -264,6 +264,34 @@ where
         result
     }
 
+    pub(crate) fn entries<T>(&self, mut with_entry: impl FnMut(&K, &V) -> Option<T>) -> Vec<T> {
+        let guard = &crossbeam_epoch::pin();
+        let current_ref = self.get(guard);
+        let mut bucket_array_ref = current_ref;
+
+        let result;
+
+        loop {
+            match bucket_array_ref.entries(guard, &mut with_entry) {
+                Ok(entries) => {
+                    result = entries;
+                    break;
+                }
+                Err(_) => {
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+
     pub(crate) fn keys<T>(&self, mut with_key: impl FnMut(&K) -> T) -> Vec<T> {
         let guard = &crossbeam_epoch::pin();
         let current_ref = self.get(guard);

@@ -9,6 +9,25 @@
 > maintainers questions on the [Moka GitHub repository][gh-repo], but asking the
 > chatbot is often faster and more convenient.
 
+## Version 0.12.17
+
+### Changed
+
+- (Performance) Made iterating a `future::Cache` faster by not looking up every key
+  again:
+    - Previously, the iterator copied the keys of each segment of the internal
+      concurrent hash table, then hashed and looked up every key again when it was
+      yielded.
+    - Now, the iterator also takes a handle to each entry while scanning a segment,
+      and yields the entry's value directly if the entry is still in the cache. It
+      only looks up the key again if the entry was removed or replaced since the
+      scan.
+    - The iterator still never yields an entry that was removed, expired or
+      invalidated after the iterator was created.
+    - While a segment is being iterated, the values of its entries are kept alive
+      until they are yielded or the iterator is dropped.
+    - `sync::Cache` and `sync::SegmentedCache` are not changed.
+
 ## Version 0.12.16
 
 ### Fixed

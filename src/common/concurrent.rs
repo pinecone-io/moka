@@ -1,7 +1,14 @@
 use crate::common::{concurrent::arc::MiniArc, deque::DeqNode, time::Instant};
 
 use parking_lot::Mutex;
-use std::{fmt, ptr::NonNull, sync::Arc};
+use std::{
+    fmt,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tagptr::TagNonNull;
 
 pub(crate) mod arc;
@@ -174,6 +181,10 @@ pub(crate) struct ValueEntry<K, V> {
     pub(crate) value: V,
     info: MiniArc<EntryInfo<K>>,
     nodes: MiniArc<Mutex<DeqNodes<K>>>,
+    /// `is_superseded` is set when an update replaces this entry in the concurrent
+    /// hash table. The replacing entry shares the same `info`, so `info` cannot tell
+    /// them apart.
+    is_superseded: AtomicBool,
 }
 
 impl<K, V> ValueEntry<K, V> {
@@ -185,6 +196,7 @@ impl<K, V> ValueEntry<K, V> {
             value,
             info: entry_info,
             nodes: MiniArc::new(Mutex::new(DeqNodes::default())),
+            is_superseded: AtomicBool::new(false),
         }
     }
 
@@ -195,7 +207,22 @@ impl<K, V> ValueEntry<K, V> {
             value,
             info: entry_info,
             nodes: MiniArc::clone(&other.nodes),
+            is_superseded: AtomicBool::new(false),
         }
+    }
+
+    /// Returns `true` iff this entry has been replaced by an update in the
+    /// concurrent hash table.
+    #[inline]
+    pub(crate) fn is_superseded(&self) -> bool {
+        self.is_superseded.load(Ordering::Acquire)
+    }
+
+    /// Must be called after the concurrent hash table has replaced this entry, not
+    /// before, so an iterator cannot yield the new value from this entry.
+    #[inline]
+    pub(crate) fn set_superseded(&self) {
+        self.is_superseded.store(true, Ordering::Release);
     }
 
     pub(crate) fn entry_info(&self) -> &MiniArc<EntryInfo<K>> {

@@ -473,6 +473,29 @@ impl<K: Hash + Eq, V, S: BuildHasher> HashMap<K, V, S> {
         result
     }
 
+    pub(crate) fn entries<T>(
+        &self,
+        segment: usize,
+        with_entry: impl FnMut(&K, &V) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        if segment >= self.segments.len() {
+            return None;
+        }
+
+        let Segment {
+            ref bucket_array,
+            ref len,
+        } = self.segments[segment];
+
+        let bucket_array_ref = BucketArrayRef {
+            bucket_array,
+            build_hasher: &self.build_hasher,
+            len,
+        };
+
+        Some(bucket_array_ref.entries(with_entry))
+    }
+
     pub(crate) fn keys<T>(&self, segment: usize, with_key: impl FnMut(&K) -> T) -> Option<Vec<T>> {
         if segment >= self.segments.len() {
             return None;
